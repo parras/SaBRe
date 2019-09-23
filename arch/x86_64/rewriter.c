@@ -53,300 +53,47 @@ static void patch_syscalls_in_func(struct library *lib,
                                            char **extra_space,
                                            int *extra_len,
                                            bool loader) {
-  struct rb_root branch_targets = RB_ROOT;
 
   _nx_debug_printf("patch_syscalls_in_func: function %p-%p\n", start, end);
 
-  {
-    // Count how many targets we'll need
-    unsigned long total = 0;
-    for (char *ptr = start; ptr < end;) {
-      unsigned short insn = next_inst(
-          (const char **)&ptr, __WORDSIZE == 64, NULL, NULL, NULL, NULL, NULL);
-      if ((insn >= 0x70 && insn <= 0x7F) /* Jcc */ || insn == 0xEB /* JMP */ ||
-          insn == 0xE8 /* CALL */ || insn == 0xE9 /* JMP */ ||
-          (insn >= 0x0F80 && insn <= 0x0F8F) /* Jcc */) {
-        total += 1;
-      }
-    }
-
-    // Allocate all the memory we'll need in one go
-    struct branch_target *target = malloc(total*sizeof(*target));
-
-    // Lookup branch targets dynamically.
-    for (char *ptr = start; ptr < end;) {
-      unsigned short insn = next_inst(
-          (const char **)&ptr, __WORDSIZE == 64, NULL, NULL, NULL, NULL, NULL);
-      char *addr;
-      if ((insn >= 0x70 && insn <= 0x7F) /* Jcc */ || insn == 0xEB /* JMP */) {
-        addr = ptr + ((signed char *)(ptr))[-1];
-      } else if (insn == 0xE8 /* CALL */ || insn == 0xE9 /* JMP */ ||
-          (insn >= 0x0F80 && insn <= 0x0F8F) /* Jcc */) {
-        addr = ptr + ((int *)(ptr))[-1];
-      } else
-        continue;
-
-      target->addr = addr;
-      rb_insert_target(&branch_targets, addr, &target->rb_target);
-      target += 1;
-    }
-  }
 
   struct code {
     char *addr;
     int len;
     unsigned short insn;
-    bool is_ip_relative;
-  } code[5] = {{0}};
+  } code = {0};
 
-  int i = 0;
   for (char *ptr = start; ptr < end;) {
     // Keep a ring-buffer of the last few instruction in order to find the
     // correct place to patch the code.
     char *mod_rm;
-    code[i].addr = ptr;
-    code[i].insn =
+    code.addr = ptr;
+    code.insn =
         next_inst((const char **)&ptr, __WORDSIZE == 64, 0, 0, &mod_rm, 0, 0);
-    code[i].len = ptr - code[i].addr;
-    code[i].is_ip_relative =
-        mod_rm && (*mod_rm & 0xC7) == 0x5;
+    code.len = ptr - code.addr;
 
     // Whenever we find a system call, we patch it with a jump to out-of-line
     // code that redirects to our system call entrypoint.
 #if defined(__NX_INTERCEPT_RDTSC) || defined(SBR_DEBUG)
     bool is_rdtsc = false;
 #endif
-    if (code[i].insn == 0x0F05 /* SYSCALL */
+    if (code.insn == 0x0F05 /* SYSCALL */
 #ifdef __NX_INTERCEPT_RDTSC
-        || ((is_rdtsc = (code[i].insn == 0x0F31)) /* RDTSC */ && !loader)
+        || ((is_rdtsc = (code.insn == 0x0F31)) /* RDTSC */ && !loader)
 #endif
        ) {
 
-      // Found a system call. Search backwards to figure out how to redirect
-      // the code. We will need to overwrite a couple of instructions and,
-      // of course, move these instructions somewhere else.
-      int start_idx = i;
-      int length = code[i].len;
-      for (int j = i; (j = (j + (sizeof(code) / sizeof(struct code)) - 1) %
-                           (sizeof(code) / sizeof(struct code))) != i;) {
-        struct branch_target *target =
-            rb_upper_bound_target(&branch_targets, code[j].addr);
-        if (target && target->addr < ptr) {
-          // Found a branch pointing to somewhere past our instruction. This
-          // instruction cannot be moved safely. Leave it in place.
-          break;
-        }
-        if (code[j].addr && !code[j].is_ip_relative &&
-            is_safe_insn(code[j].insn)) {
-          // These are all benign instructions with no side-effects and no
-          // dependency on the program counter. We should be able to safely
-          // relocate them.
-          start_idx = j;
-          length = ptr - code[start_idx].addr;
-        } else {
-          break;
-        }
-      }
-// Search forward past the system call, too. Sometimes, we can only find
-// relocatable instructions following the system call.
-      char *next = ptr;
-      for (int j = i;
-           next < end && (j = (j + 1) % (sizeof(code) / sizeof(struct code))) !=
-                             start_idx;) {
-        struct branch_target *target =
-            rb_lower_bound_target(&branch_targets, next);
-        if (target && target->addr == next) {
-          // Found branch target pointing to our instruction
-          break;
-        }
-        char *tmp_rm;
-        code[j].addr = next;
-        code[j].insn = next_inst(
-            (const char **)&next, __WORDSIZE == 64, 0, 0, &tmp_rm, 0, 0);
-        code[j].len = next - code[j].addr;
-        code[j].is_ip_relative = tmp_rm && (*tmp_rm & 0xC7) == 0x5;
-        if (!code[j].is_ip_relative && is_safe_insn(code[j].insn)) {
-          length = next - code[start_idx].addr;
-        } else {
-          break;
-        }
-      }
-      // We now know, how many instructions neighboring the system call we can
-      // safely overwrite. On x86-32 we need six bytes, and on x86-64 We need
-      // five bytes to insert a JMPQ and a 32bit address. We then jump to a
-      // code fragment that safely forwards to our system call entrypoint.
-      //
-      // On x86-64, this is complicated by the fact that the API allows up to
-      // 128 bytes of red-zones below the current stack pointer. So, we cannot
-      // write to the stack until we have adjusted the stack pointer.
-      //
-      // On both x86-32 and x86-64 we take care to leave the stack unchanged
-      // while we are executing the preamble and postamble. This allows us to
-      // treat instructions that reference %esp/%rsp as safe for relocation.
-      //
-      // In particular, this means that on x86-32 we cannot use CALL, but have
-      // to use a PUSH/RET combination to change the instruction pointer. On
-      // x86-64, we can instead use a 32bit JMPQ.
-      //
-      // .. .. .. .. ; any leading instructions copied from original code
-      // 48 81 EC 80 00 00 00        SUB  $0x80, %rsp
-      // 50                          PUSH %rax
-      // 48 8D 05 .. .. .. ..        LEA  ...(%rip), %rax
-      // 50                          PUSH %rax
-      // 48 B8 .. .. .. ..           MOV  $syscall_enter_with_frame, %rax
-      // .. .. .. ..
-      // 50                          PUSH %rax
-      // 48 8D 05 06 00 00 00        LEA  6(%rip), %rax
-      // 48 87 44 24 10              XCHG %rax, 16(%rsp)
-      // C3                          RETQ
-      // 48 81 C4 80 00 00 00        ADD  $0x80, %rsp
-      // .. .. .. .. ; any trailing instructions copied from original code
-      // E9 .. .. .. ..              JMPQ ...
-      //
-      // Total: 52 bytes + any bytes that were copied
-      //
-      // On x86-32, the stack is available and we can do:
-      //
-      // TODO(markus): Try to maintain frame pointers on x86-32
-      //
-      // .. .. .. .. ; any leading instructions copied from original code
-      // 68 .. .. .. ..              PUSH . + 11
-      // 68 .. .. .. ..              PUSH return_addr
-      // 68 .. .. .. ..              PUSH $syscall_enter_with_frame
-      // C3                          RET
-      // .. .. .. .. ; any trailing instructions copied from original code
-      // 68 .. .. .. ..              PUSH return_addr
-      // C3                          RET
-      //
-      // Total: 22 bytes + any bytes that were copied
-      //
-      // For indirect jumps from the VDSO to the VSyscall page, we instead
-      // replace the following code (this is only necessary on x86-64). This
-      // time, we don't have to worry about red zones:
-      //
-      // .. .. .. .. ; any leading instructions copied from original code
-      // E8 00 00 00 00              CALL .
-      // 48 83 04 24 ..              ADDQ $.., (%rsp)
-      // FF .. .. .. .. ..           PUSH ..  ; from original CALL instruction
-      // 48 81 3C 24 00 00 00 FF     CMPQ $0xFFFFFFFFFF000000, 0(%rsp)
-      // 72 10                       JB   . + 16
-      // 81 2C 24 .. .. .. ..        SUBL ..., 0(%rsp)
-      // C7 44 24 04 00 00 00 00     MOVL $0, 4(%rsp)
-      // C3                          RETQ
-      // 48 87 04 24                 XCHG %rax,(%rsp)
-      // 48 89 44 24 08              MOV  %rax, 8(%rsp)
-      // 58                          POP  %rax
-      // C3                          RETQ
-      // .. .. .. .. ; any trailing instructions copied from original code
-      // E9 .. .. .. ..              JMPQ ...
-      //
-      // Total: 52 bytes + any bytes that were copied
-
-      if (length < (__WORDSIZE == 32 ? 6 : 5)) {
         // If we cannot figure out any other way to intercept this syscall/RDTSC,
         // we replace it with an illegal instruction. This causes a SIGILL which we then
         // handle in the signal handler. That's a lot slower than rewriting the
         // instruction with a jump, but it should only happen very rarely.
 #ifdef __NX_INTERCEPT_RDTSC
-        if (is_rdtsc) {
-          memcpy(code[i].addr, "\x0F\x0B" /* UD2 */, 2);
-          goto replaced;
-        }
+        if (is_rdtsc)
+          memcpy(code.addr, "\x0F\x0B" /* UD2 */, 2);
         else
 #endif
-        {
-          memcpy(code[i].addr, "\x0F\xFF" /* UD0 */, 2);
-          goto replaced;
-        }
-      }
-      int needed = (__WORDSIZE == 32 ? 6 : 5) - code[i].len;
-      int first = i;
-      while (needed > 0 && first != start_idx) {
-        first = (first + (sizeof(code) / sizeof(struct code)) - 1) %
-                (sizeof(code) / sizeof(struct code));
-        needed -= code[first].len;
-      }
-      int second = i;
-      while (needed > 0) {
-        second = (second + 1) % (sizeof(code) / sizeof(struct code));
-        needed -= code[second].len;
-      }
-      int preamble = code[i].addr - code[first].addr;
-      int postamble =
-          code[second].addr + code[second].len - code[i].addr - code[i].len;
-
-      // The following is all the code that construct the various bits of
-      // assembly code.
-      needed = 52 + preamble + postamble;
-
-      // Allocate scratch space and copy the preamble of code that was moved
-      // from the function that we are patching.
-      char *dest = alloc_scratch_space(
-          lib->maps->fd, code[first].addr, needed, extra_space, extra_len, true, TRAMPOLINE_MAX_DISTANCE);
-      memcpy(dest, code[first].addr, preamble);
-
-      // For jumps from the VDSO to the VSyscalls we sometimes allow exactly
-      // one IP relative instruction in the preamble.
-      if (code[first].is_ip_relative) {
-        *(int *)(dest + (code[i].addr - code[first].addr) - 4) -=
-            dest - code[first].addr;
-      }
-
-      // Copy the static body of the assembly code.
-      memcpy(
-          dest + preamble,
-              "\x48\x81\xEC\x80\x00\x00\x00" // SUB  $0x80, %rsp
-              "\x50"                         // PUSH %rax
-              "\x48\x8D\x05\x00\x00\x00\x00" // LEA  ...(%rip), %rax
-              "\x50"                         // PUSH %rax
-              "\x48\xB8\x00\x00\x00\x00\x00" // MOV $entrypoint,
-              "\x00\x00\x00"                 //     %rax
-              "\x50"                         // PUSH %rax
-              "\x48\x8D\x05\x06\x00\x00\x00" // LEA  6(%rip), %rax
-              "\x48\x87\x44\x24\x10"         // XCHG %rax, 16(%rsp)
-              "\xC3"                         // RETQ
-              "\x48\x81\xC4\x80\x00\x00",    // ADD  $0x80, %rsp
-          47
-          );
-
-      // Copy the postamble that was moved from the function that we are
-      // patching.
-      memcpy(dest + preamble + 47,
-             code[i].addr + code[i].len,
-             postamble);
-
-      // Patch up the various computed values
-      int post = preamble + 47 + postamble;
-      dest[post] = '\xE9';  // JMPQ
-      *(int *)(dest + post + 1) =
-          (code[second].addr + code[second].len) - (dest + post + 5);
-      *(int *)(dest + preamble + 11) =
-          (code[second].addr + code[second].len) - (dest + preamble + 15);
-      void* entrypoint;
-
-      if (loader)
-        entrypoint = handle_syscall_loader;
-#ifdef __NX_INTERCEPT_RDTSC
-      else if (is_rdtsc) {
-        entrypoint = rdtsc_entrypoint;
-      }
-#endif
-      else
-        entrypoint = handle_syscall;
-      *(void **)(dest + preamble + 18) = entrypoint;
-      // Pad unused space in the original function with NOPs
-      memset(code[first].addr,
-             0x90 /* NOP */,
-             code[second].addr + code[second].len - code[first].addr);
-
-      // Replace the system call with an unconditional jump to our new code.
-      *code[first].addr = '\xE9';  // JMPQ
-      *(int *)(code[first].addr + 1) = dest - (code[first].addr + 5);
-      _nx_debug_printf("patched %s at %p (scratch space at %p)\n",
-                  (is_rdtsc ? "rdtsc" : "syscall"), code[i].addr, dest);
+          memcpy(code.addr, "\x0F\xFF" /* UD0 */, 2);
     }
-  replaced:
-    i = (i + 1) % (sizeof(code) / sizeof(struct code));
   }
 }
 
